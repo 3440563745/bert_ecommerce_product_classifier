@@ -29,3 +29,9 @@ runs/
 data/processed/
 .ipynb_checkpoints
 .DS_Store
+pretrained/
+*.safetensors
+*.downloading
+*.pth
+*.bin
+*.pt
