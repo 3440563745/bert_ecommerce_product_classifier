@@ -1,0 +1,31 @@
+# Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.py[cod]
+
+# Virtual environment
+venv/
+env/
+
+# Model weights & pretrained bert (too large for github)
+models/
+pretrained/
+*.pt
+*.pth
+*.safetensors
+*.bin
+
+# Tensorboard logs
+logs/
+runs/
+*.log
+
+# IDE config
+.idea/
+.vscode/
+
+# Dataset cache
+data/processed/
+.ipynb_checkpoints
+.DS_Store
