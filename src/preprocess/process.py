@@ -13,7 +13,7 @@ def process():
     # print(dataset_dict)
     # print(dataset_dict["train"][0])
     # 数据清洗
-    dataset_dict.filter(lambda x: x["label"] is not None and x["text_a"] is not None)
+    dataset_dict=dataset_dict.filter(lambda x: x["label"] is not None and x["text_a"] is not None)
     # print(dataset_dict["train"]["label"])
     # 保存labels
     labels = sorted(set(dataset_dict["train"]["label"]))
