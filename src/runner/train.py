@@ -2,7 +2,8 @@ from dataclasses import dataclass
 
 import torch
 import time
-
+import os
+os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 from sklearn.metrics import accuracy_score, f1_score
 from tqdm import tqdm
 from torch.optim.adam import Adam
@@ -26,8 +27,9 @@ class TrainingConfig:
     batch_size:int=16
     learning_rate:float=5e-5
     output_dir:str="./models"
-    save_steps:int=100
+    save_steps:int=30
     logs_dir:str="./logs"
+    stop_metric:str="loss"
 #也就是一步可以抵最上面的那一个的两步动作
 
 class trainer:
@@ -43,7 +45,9 @@ class trainer:
         self.step=1
         self.writer=SummaryWriter(log_dir=str(Path(self.training_config.logs_dir)/time.strftime("%Y-%m-%d-%H_%M_%S")))
         self.min_loss=float("inf")
-
+        self.best_stop_score=-float("inf")
+        self.stop_counter=0
+        self.stop_counter_max=3
     def _get_dataloader(self,dataset):
         dataset.set_format(type="torch")
         return DataLoader(dataset=dataset,
@@ -63,14 +67,30 @@ class trainer:
                     metrics_str="|".join([f"{k}:{v:.4f}" for k,v in results.items()])
                     tqdm.write(f"Evaluation:{metrics_str}")
 
-
-                    if loss<self.min_loss:
-                        tqdm.write("保存模型")
-                        self.min_loss=loss
-                        self.model.save_pretrained(self.training_config.output_dir)
+                    if self._should_stop(results):
+                        tqdm.write("早停")
+                        return
+                    # if loss<self.min_loss:
+                    #     tqdm.write("保存模型")
+                    #     self.min_loss=loss
+                    #     self.model.save_pretrained(self.training_config.output_dir)
                 self.step+=1
 
         # print("training...")
+    def _should_stop(self,metrics):
+        score=-metrics[self.training_config.stop_metric] if self.training_config.stop_metric=="loss" else metrics[self.training_config.stop_metric]
+        if score >self.best_stop_score:
+            tqdm.write("保存模型")
+            self.best_stop_score=score
+            self.stop_counter=0
+            self.model.save_pretrained(self.training_config.output_dir)
+            return False
+        else:
+            self.stop_counter+=1
+            if self.stop_counter>=self.stop_counter_max:
+                return True
+            else:
+                return False
     def train_one_step(self,inputs):
         self.model.train()
         inputs={k:v.to(self.device) for k,v in inputs.items()}
@@ -108,18 +128,20 @@ if __name__ == "__main__":
     print(labels)
     lable2id={label:index for index,label in enumerate(labels)}
     id2label={index:label for index,label in enumerate(labels)}
-    model=AutoModelForSequenceClassification.from_pretrained(str(MODELS_DIR),
+    model=AutoModelForSequenceClassification.from_pretrained("bert-base-chinese",
                                                              num_labels=len(labels),
                                                              id2label=id2label,
                                                              label2id=lable2id)
-    # print(model)
+    # print(model)str(MODELS_DIR)PRE_TRAINED_DIR/"bert-base-chinese"
     # model.save_pretrained(MODELS_DIR)
     def compute_metrics(all_predictions, all_labels)->dict:
         accuracy=accuracy_score(all_labels,all_predictions)
         f1=f1_score(all_labels,all_predictions,average="weighted")
         return {"accuracy":accuracy,"f1":f1}
 
-    tokenzier=AutoTokenizer.from_pretrained(PRE_TRAINED_DIR/"bert-base-chinese")
+    tokenzier=AutoTokenizer.from_pretrained("bert-base-chinese")
+    # train_dataset=get_dataset("train").select(range(2000))
+    # valid_dataset=get_dataset("valid").select(range(300))
     train_dataset=get_dataset("train")
     valid_dataset=get_dataset("valid")
     training_config=TrainingConfig(output_dir=MODELS_DIR,logs_dir=LOG_DIR)
