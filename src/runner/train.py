@@ -24,16 +24,28 @@ from preprocess.dataset import get_dataloader, get_dataset
 @dataclass
 class TrainingConfig:
     epochs:int=10
-    batch_size:int=16
+    batch_size:int=64
     learning_rate:float=5e-5
-    output_dir:str="./models"
-    save_steps:int=30
+    output_dir:str=str(MODELS_DIR/"best")
+    save_steps:int=100
     logs_dir:str="./logs"
     stop_metric:str="loss"
+    use_amp=True
+    checkpoint_dir:str=str(MODELS_DIR/"checkpoint"/"checkpoint.pt")
+
+    def __post_init__(self):
+        """初始化后自动创建所有需要的目录"""
+        Path(self.output_dir).mkdir(parents=True, exist_ok=True)
+        Path(self.checkpoint_dir).parent.mkdir(parents=True, exist_ok=True)
+        Path(self.logs_dir).mkdir(parents=True, exist_ok=True)
+        print(f"✅ 目录已创建:")
+        print(f"   output_dir: {self.output_dir}")
+        print(f"   checkpoint_dir: {self.checkpoint_dir}")
+        print(f"   logs_dir: {self.logs_dir}")
 #也就是一步可以抵最上面的那一个的两步动作
 
 class trainer:
-    def __init__(self,compute_metrics,device,model,train_dataset,valid_dataset,training_config,collate_fn):
+    def __init__(self,compute_metrics,device,model,valid_dataset,collate_fn,train_dataset=None,training_config=TrainingConfig()):
         self.training_config = training_config
         self.device=device
         self.model=model.to(device)
@@ -47,18 +59,28 @@ class trainer:
         self.min_loss=float("inf")
         self.best_stop_score=-float("inf")
         self.stop_counter=0
-        self.stop_counter_max=3
+        self.stop_counter_max=10
+        self.scaler=torch.cuda.amp.GradScaler(enabled=self.training_config.use_amp)
+
     def _get_dataloader(self,dataset):
         dataset.set_format(type="torch")
+        generator=torch.Generator()
+        generator.manual_seed(42)
+        #保证检查点后的数据加载都是一样的
         return DataLoader(dataset=dataset,
                           batch_size=self.training_config.batch_size,
                           shuffle=True,
                           collate_fn=self.collate_fn)
     def train(self):
         dataloader=self._get_dataloader(dataset=self.train_dataset)
-
+        self._load_checkpoint()
+        current_step=0
+        print(f"保存位置:{self.training_config.output_dir}")
         for epoch in range(1,self.training_config.epochs+1):
-            for batch in tqdm(dataloader,desc=f"epoch:{epoch}",position=0):
+            for batch in tqdm(dataloader,desc=f"epoch:{epoch}"):
+                current_step += 1
+                if current_step<self.step:
+                    continue
                 loss=self.train_one_step(batch)
                 if self.step %self.training_config.save_steps==0:
                     tqdm.write(f"epoch:{epoch},step:{self.step},loss:{loss}")
@@ -70,6 +92,7 @@ class trainer:
                     if self._should_stop(results):
                         tqdm.write("早停")
                         return
+                    self._save_checkpoint()
                     # if loss<self.min_loss:
                     #     tqdm.write("保存模型")
                     #     self.min_loss=loss
@@ -77,6 +100,30 @@ class trainer:
                 self.step+=1
 
         # print("training...")
+    def _load_checkpoint(self):
+        path=Path(self.training_config.checkpoint_dir)
+        if path.exists():
+            tqdm.write("发现检查点，继续训练")
+            checkpoints=torch.load(self.training_config.checkpoint_dir)
+            self.model.load_state_dict(checkpoints["model_state_dict"])
+            self.optimizer.load_state_dict(checkpoints["optimizer_state_dict"])
+            self.scaler.load_state_dict(checkpoints["scaler_state_dict"])
+            self.step=checkpoints["step"]
+            self.stop_counter=checkpoints["stop_counter"]
+            self.best_stop_score=checkpoints["best_stop_score"]
+        else:
+            tqdm.write("未发现检查点")
+    def _save_checkpoint(self):
+        print("开始保存ckeckpoins")
+        checkpoint={
+            "model_state_dict":self.model.state_dict(),
+            "optimizer_state_dict":self.optimizer.state_dict(),
+            "scaler_state_dict":self.scaler.state_dict(),
+            "step":self.step,
+            "best_stop_score":self.best_stop_score,
+            "stop_counter":self.stop_counter
+        }
+        torch.save(checkpoint,self.training_config.checkpoint_dir)
     def _should_stop(self,metrics):
         score=-metrics[self.training_config.stop_metric] if self.training_config.stop_metric=="loss" else metrics[self.training_config.stop_metric]
         if score >self.best_stop_score:
@@ -84,8 +131,12 @@ class trainer:
             self.best_stop_score=score
             self.stop_counter=0
             self.model.save_pretrained(self.training_config.output_dir)
+            print(f"保存位置:{self.training_config.output_dir}")
+            print(f"保存位置:{self.training_config.output_dir}")
+            print(f"保存位置:{self.training_config.output_dir}")
             return False
         else:
+            # self.stop_counter=0#fffffff
             self.stop_counter+=1
             if self.stop_counter>=self.stop_counter_max:
                 return True
@@ -94,10 +145,14 @@ class trainer:
     def train_one_step(self,inputs):
         self.model.train()
         inputs={k:v.to(self.device) for k,v in inputs.items()}
-        outputs=self.model(**inputs)
-        loss=outputs.loss
-        loss.backward()
-        self.optimizer.step()
+        with torch.autocast(enabled=self.training_config.use_amp,device_type=self.device.type,dtype=torch.float16):
+             outputs=self.model(**inputs)
+             loss=outputs.loss
+        # loss.backward()
+        self.scaler.scale(loss).backward()
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
+        # self.optimizer.step()
         self.optimizer.zero_grad()
         return loss.item()
     def evaluate(self):
@@ -106,7 +161,7 @@ class trainer:
         total_loss=0
         all_prediction=[]
         all_labels=[]
-        for batch in dataloader:
+        for batch in tqdm(dataloader,desc="evaluate"):
             inputs={k:v.to(self.device) for k,v in batch.items()}
             outputs=self.model(**inputs)
             loss=outputs.loss
@@ -120,34 +175,35 @@ class trainer:
         metrics=self.compute_metrics(all_prediction,all_labels)
         return {"loss":loss,**metrics}
 
-
-if __name__ == "__main__":
-    device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    with open(MODELS_DIR/"labels.txt","r",encoding="utf-8") as f:
-        labels=[line.strip() for line in f.readlines()]
+def train():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    with open(MODELS_DIR / "labels.txt", "r", encoding="utf-8") as f:
+        labels = [line.strip() for line in f.readlines()]
     print(labels)
-    lable2id={label:index for index,label in enumerate(labels)}
-    id2label={index:label for index,label in enumerate(labels)}
-    model=AutoModelForSequenceClassification.from_pretrained("bert-base-chinese",
-                                                             num_labels=len(labels),
-                                                             id2label=id2label,
-                                                             label2id=lable2id)
+    lable2id = {label: index for index, label in enumerate(labels)}
+    id2label = {index: label for index, label in enumerate(labels)}
+    model = AutoModelForSequenceClassification.from_pretrained("bert-base-chinese",
+                                                               num_labels=len(labels),
+                                                               id2label=id2label,
+                                                               label2id=lable2id)
+
     # print(model)str(MODELS_DIR)PRE_TRAINED_DIR/"bert-base-chinese"
     # model.save_pretrained(MODELS_DIR)
-    def compute_metrics(all_predictions, all_labels)->dict:
-        accuracy=accuracy_score(all_labels,all_predictions)
-        f1=f1_score(all_labels,all_predictions,average="weighted")
-        return {"accuracy":accuracy,"f1":f1}
+    def compute_metrics(all_predictions, all_labels) -> dict:
+        accuracy = accuracy_score(all_labels, all_predictions)
+        f1 = f1_score(all_labels, all_predictions, average="weighted")
+        return {"accuracy": accuracy, "f1": f1}
 
-    tokenzier=AutoTokenizer.from_pretrained("bert-base-chinese")
+    tokenzier = AutoTokenizer.from_pretrained("bert-base-chinese")
     # train_dataset=get_dataset("train").select(range(2000))
     # valid_dataset=get_dataset("valid").select(range(300))
-    train_dataset=get_dataset("train")
-    valid_dataset=get_dataset("valid")
-    training_config=TrainingConfig(output_dir=MODELS_DIR,logs_dir=LOG_DIR)
-    collate_fn=DataCollatorWithPadding(tokenizer=tokenzier,padding=True,return_tensors="pt")
+    train_dataset = get_dataset("train")
+    valid_dataset = get_dataset("valid")
+    training_config = TrainingConfig()
+    collate_fn = DataCollatorWithPadding(tokenizer=tokenzier, padding=True, return_tensors="pt")
 
-
-    trainer=trainer(compute_metrics,device,model,train_dataset,valid_dataset,training_config,collate_fn)
-    trainer.train()
+    trainer1 = trainer(compute_metrics, device, model, valid_dataset, collate_fn, train_dataset, training_config)
+    trainer1.train()
+if __name__ == "__main__":
+    train()
 

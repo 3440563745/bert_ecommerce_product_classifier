@@ -36,6 +36,7 @@ def process():
     def encode(batch):
         outputs = tokenizer(batch["text_a"], truncation=True, return_token_type_ids=False)
         outputs["labels"] = batch["label"]
+        print(f"encode outputs: {outputs}")
         return outputs
 
     dataset_dict = dataset_dict.map(encode, batched=True, remove_columns=["text_a", "label"])
